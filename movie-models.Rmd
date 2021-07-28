@@ -1,0 +1,608 @@
+---
+title: "Recommender Systems: Predicting movie ratings with MovieLens"
+author: "Alex V. Hadar"
+date: "7/28/2021"
+output: pdf_document
+bibliography: biblio-recsys.bib
+nocite: '@irizarry2019introduction'
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, fig.align='center', out.width="50%")
+```
+
+## Introduction
+
+Recommender systems have become in recent years part of everyday life for an increasing number of people. Although many of us use them for shopping, movie selection or music choice, the inner workings of such a system are not always obvious.
+
+The general approach includes user and item data, ratings and similarities. 
+In more detail, the recommender systems literature mentions different types of recommenders:
+non-personalized (based on item groupings), personalized (based on user-item groupings), content-based (using descriptions or reviews).
+
+Models and methods used to predict user ratings or create lists of recommendations range from linear regression, collaborative filtering, matrix factorization to neural networks.
+
+In this project we will use the Movielens-10M data to predict user ratings based on other ratings only. Alternative approaches could add genre or temporal data to rating data.
+
+## Analysis
+
+We start the analysis with an overview of the data, followed by a short visual exploration. After this, we present 
+different recommendation algorithms and their performance. Finally, the best model is used for predictions. 
+Recommender problems can be regarded as regression, which means we can use RMSE and  MAE as performance metrics:
+
+RMSE (Root Mean Squared Error): $\sqrt{\dfrac{1}{N}\sum(y - \hat{y})^2} = \sqrt{\dfrac{1}{N}\sum_{u, i}(y_{u, i} - \hat{y}_{u, i})^2}$
+
+MAE (Mean Absolute Error): $\dfrac{1}{N}\sum|y - \hat{y}| = \dfrac{1}{N}\sum_{u, i}|y_{u, i} - \hat{y}_{u, i}|$
+
+
+where $u$ is the user, $i$ is the movie, $N$ is the total number of ratings, $y_{u,i}$ is the rating given by user $u$ for movie $i$, and $\hat{y}_{u,i}$ is the predicted rating given by user $u$ for movie $i$.
+
+
+### Exploratory data analysis (EDA)
+
+The Movielens-10M dataset can be downloaded and unpacked using the following code:
+
+```{r load-lib, echo=FALSE, message=FALSE}
+
+if(!require(tidyverse)) install.packages("tidyverse", repos = "http://cran.us.r-project.org")
+if(!require(caret)) install.packages("caret", repos = "http://cran.us.r-project.org")
+if(!require(data.table)) install.packages("data.table", repos = "http://cran.us.r-project.org")
+if(!require(recosystem)) install.packages("recosystem", repos = "http://cran.us.r-project.org")
+if(!require(tinytex)) install.packages("tinytex", repos = "http://cran.us.r-project.org")
+
+library(tidyverse)
+library(caret)
+library(data.table)
+library(Matrix)
+library(recosystem)
+library(tinytex)
+```
+
+```{r download-data, message=FALSE}
+# MovieLens 10M dataset:
+# https://grouplens.org/datasets/movielens/10m/
+# http://files.grouplens.org/datasets/movielens/ml-10m.zip
+
+dl <- tempfile()
+download.file("http://files.grouplens.org/datasets/movielens/ml-10m.zip", dl)
+
+ratings <- fread(text = gsub("::", "\t", readLines(unzip(dl, "ml-10M100K/ratings.dat"))),
+                 col.names = c("userId", "movieId", "rating", "timestamp"))
+
+movies <- str_split_fixed(readLines(unzip(dl, "ml-10M100K/movies.dat")), "\\::", 3)
+colnames(movies) <- c("movieId", "title", "genres")
+
+# if using R 3.6 or earlier:
+movies <- as.data.frame(movies) %>% mutate(movieId = as.numeric(levels(movieId))[movieId],
+                                           title = as.character(title),
+                                           genres = as.character(genres))
+# if using R 4.0 or later:
+# movies <- as.data.frame(movies) %>% mutate(movieId = as.numeric(movieId),
+#                                            title = as.character(title),
+#                                            genres = as.character(genres))
+
+movielens <- left_join(ratings, movies, by = "movieId")
+```
+
+According to the Moveielens site, the data includes 10 million ratings and additional data, generated for 10000 movies by 72000 users. 
+Ratings range from 0.5 to 5.0 stars in increments of 0.5. This means half-star ratings are allowed. Also, the total number of ratings is
+significantly lower than the number of  users times the number of movies, which means sparse rating data.
+
+For the purpose of analysis and modeling we split the data in two parts: edx and validation dataset, with 90% allocated to edx, 10% to the validation.
+The edx part will be used for training/test of various models. The validation data is the final holdout dataset and will be used on the chosen algorithm for performance evaluation using RMSE. Users and movies included in the validation data are also present in the edx data, to avoid predictions for new users without available data.
+
+```{r split-edx-vali, message=FALSE, warning=FALSE}
+# Validation set will be 10% of MovieLens data
+set.seed(1, sample.kind="Rounding") # if using R 3.5 or earlier, use `set.seed(1)`
+test_index <- createDataPartition(y = movielens$rating, times = 1, p = 0.1, list = FALSE)
+edx <- movielens[-test_index,]
+temp <- movielens[test_index,]
+
+# Make sure userId and movieId in validation set are also in edx set
+validation <- temp %>% 
+  semi_join(edx, by = "movieId") %>%
+  semi_join(edx, by = "userId")
+
+# Add rows removed from validation set back into edx set
+removed <- anti_join(temp, validation)
+edx <- rbind(edx, removed)
+
+rm(dl, ratings, movies, test_index, temp, movielens, removed)
+
+# store the edx and validation data for later use
+saveRDS(edx, file = "edx.Rda")
+saveRDS(validation, file = "vali.Rda")
+```
+
+The edx data consists of `r dim(edx)[1]` ratings created by `r length(unique(edx$userId))` users for `r length(unique(edx$movieId))` movies.
+It also includes genre information for the movies and timestamps of the ratings.
+
+```{r data-head, message=FALSE, warning=FALSE}
+head(edx)
+```
+
+```{r clean-up-1, echo=FALSE, message=FALSE, warning=FALSE, results=FALSE}
+rm(edx, validation)
+gc()
+```
+
+
+Only the edx data will be used for training and tuning the models. For this reason, we split this data in two parts: 
+training and test data, with 90% allocated to training, 10% to test. We are interested in the available ratings, 
+not genre or time features.
+
+```{r split-train-test, message=FALSE, warning=FALSE}
+edx <- readRDS("edx.Rda")
+# keep only the rating information
+edx.user.ratings <- edx %>% select(userId, movieId, rating)
+# head(edx.user.ratings)
+
+# test set will be 10% of edx data
+# set.seed(1, sample.kind="Rounding") # set before, so not needed again;
+test_index <- createDataPartition(y = edx.user.ratings$rating, times = 1, p = 0.1, 
+                                    list = FALSE)
+train <- edx.user.ratings[-test_index,]
+temp <- edx.user.ratings[test_index,]
+
+# Make sure userId and movieId in test set are also in edx training set
+test <- temp %>% 
+  semi_join(train, by = "movieId") %>%
+  semi_join(train, by = "userId")
+
+# Add rows removed from test set back into edx training set
+removed <- anti_join(temp, test)
+train <- rbind(train, removed)
+
+rm(test_index, temp, edx.user.ratings, removed)
+```
+
+```{r clean-up-2, echo=FALSE, message=FALSE, warning=FALSE, results=FALSE}
+gc()
+```
+
+The next step is a short visual exploration of the data.
+
+#### Rating distribution (number of ratings per class/number of stars)  
+
+There are less half-star ratings than full-star ratings. Most ratings are at least 3 stars.
+
+```{r rating-class, warning=FALSE, message=FALSE}
+edx %>% group_by(rating) %>% summarize(count = n()) %>% 
+  ggplot(aes(x = rating, y = count)) + geom_line()
+
+edx %>% ggplot(aes(x = as.factor(rating))) + geom_bar(aes(fill = as.factor(rating)))
+```
+
+#### Rating distribution (number of ratings per user)  
+
+There are only a few users who rated many thousand movies. This means that overall the ratings matrix is sparse,
+because each user rates only a small part of the available movies.
+
+```{r user-ratings, warning=FALSE, message=FALSE}
+user.ratings <- edx %>% group_by(userId) %>% 
+                  summarize(n= n(), avg.rating = mean(rating))
+user.ratings %>% ggplot(aes(x = userId, y = n)) + geom_line()
+```
+
+#### Rating distribution (number of ratings per movie)  
+
+Some movies are rated and watched by tens of thousands of users - the blockbuster movies, while others are only rated 
+hundreds  of times or less.
+
+```{r movie-ratings, warning=FALSE, message=FALSE}
+movie.ratings <- edx %>% group_by(movieId) %>% 
+                   summarize(n= n(), avg.rating = mean(rating))
+movie.ratings %>% ggplot(aes(x = movieId, y = n)) + geom_line()
+```
+
+#### Genre (selection, non-exclusive)
+
+Drama and comedy are among the most popular genres.
+
+```{r genre-counts, echo=FALSE, warning=FALSE, message=FALSE}
+# explore the genre counts for selected genres
+genres <- c("Drama", "Comedy", "Thriller", "Romance", "Adventure", "Sci-Fi")
+sapply(genres, function(g){
+  sum(str_detect(edx$genres, g))
+})
+```
+
+#### Top movie counts
+
+Most-rated movies from the dataset are shown below:
+
+```{r top-movies, warning=FALSE, message=FALSE}
+# explore the movie top counts
+most_rated <- edx %>% group_by(movieId, title) %>% 
+         summarize(count = n()) %>% arrange(desc(count))
+head(most_rated, n=10)
+```
+
+```{r clean-up-3, echo=FALSE, warning=FALSE, message=FALSE, results=FALSE}
+rm(edx)
+rm(movie.ratings, user.ratings)
+gc()
+```
+
+
+### Models
+
+### Same rating for all users and movies  
+
+For a first simple model, we assume that the predicted value is always the 
+mean value of all ratings from the dataset. There are no differences between users or movies in this setting.
+
+$Y_{u,i} = \mu + \varepsilon_{u,i}$
+
+```{r model-mean, warning=FALSE, message=FALSE}
+# Root Mean Square Error
+RMSE <- function(true_ratings, predicted_ratings){
+  sqrt(mean((true_ratings - predicted_ratings)^2))
+}
+
+# Mean Absolute Error
+MAE <- function(true_ratings, predicted_ratings){
+  mean(abs(true_ratings - predicted_ratings))
+}
+
+
+mu <- mean(train$rating)
+mu
+```
+
+Model performance is determined using RMSE and MAE, then the results are stored:
+
+```{r model-mean-rmse-mae, warning=FALSE, message=FALSE}
+rmse.model1 <- RMSE(test$rating, mu)
+rmse.model1
+
+mae.model1 <- MAE(test$rating, mu)
+mae.model1
+
+rmse_results <- data_frame(method = "Mean value", RMSE = rmse.model1, MAE = mae.model1)
+```
+
+### Model with movie effect
+There are differences between movies, which are accounted for using the movie effect
+variable. 
+For example, some movies are blockbusters and are rated consistently high by a large number of users, 
+while other, lesser known movies, may have mixed reviews.
+
+$Y_{u,i} = \mu + b_i + \varepsilon_{u,i}$
+
+```{r model-movie-effect, warning=FALSE, message=FALSE}
+# mu <- mean(train$rating) 
+movie_avgs <- train %>% 
+  group_by(movieId) %>% 
+  summarize(b_i = mean(rating - mu))
+
+movie_avgs %>% qplot(b_i, geom ="histogram", bins = 10, data = ., color = I("black"))
+
+predicted_ratings <- mu + test %>% 
+  left_join(movie_avgs, by='movieId') %>%
+  .$b_i
+
+rmse.model2 <- RMSE(test$rating, predicted_ratings)
+mae.model2 <- MAE(test$rating, predicted_ratings)
+
+rmse_results <- bind_rows(rmse_results,
+                          data_frame(method="Movie Effects Model",
+                                     RMSE = rmse.model2, MAE = mae.model2 ))
+```
+
+### Model with movie effect and user effect
+
+In addition to movie differences. , there are also differences between users.
+Users which give consistently high or consistently low ratings are considered when we add a user effect
+variable to the model.
+
+$Y_{u,i} = \mu + b_i + b_u + \varepsilon_{u,i}$
+
+```{r model-movie-user-effect, warning=FALSE, message=FALSE}
+train%>% 
+  group_by(userId) %>% 
+  summarize(b_u = mean(rating)) %>% 
+  filter(n()>=100) %>%
+  ggplot(aes(b_u)) + 
+  geom_histogram(bins = 30, color = "black")
+
+# lm is VERY slow here -> do not run this code
+# lm(rating ~ as.factor(movieId) + as.factor(userId))
+user_avgs <- test %>% 
+  left_join(movie_avgs, by='movieId') %>%
+  group_by(userId) %>%
+  summarize(b_u = mean(rating - mu - b_i))
+
+predicted_ratings <- test%>% 
+  left_join(movie_avgs, by='movieId') %>%
+  left_join(user_avgs, by='userId') %>%
+  mutate(pred = mu + b_i + b_u) %>%
+  .$pred
+
+rmse.model3 <- RMSE(test$rating, predicted_ratings)
+mae.model3 <- MAE(test$rating, predicted_ratings)
+
+rmse_results <- bind_rows(rmse_results,
+                          data_frame(method="Movie + User Effects Model",  
+                                     RMSE = rmse.model3, MAE = mae.model3 ))
+```
+
+### Model using regularization
+
+In order to avoid overfitting and poor performance, regularization can be used.
+In this case, a penalty term is applied to the model and affects the error weight: higher errors have higher impact. For our model the terms are squared. Regularizaton can be applied to variables(movie effect) or to groups of variables(movie and user effects).
+
+To determine the regularization parameter $lambda$ we use cross-validation. 
+We also take into consideration the different number of ratings per movie and per user.
+
+Regularization for movie effects:
+
+$Y_{u,i} = \mu + \dfrac{1}{\lambda + n_i} b_i + \varepsilon_{u,i}$
+
+In this case we minimize $\sum_{u, i} (y_{u,i} - \mu - b_i)^2 + \lambda \sum_i b_i^2$.
+
+```{r model-movie-reg, warning=FALSE, message=FALSE}
+# for movie effects
+# choose lambda using cross validation
+lambdas <- seq(0, 10, 0.25)
+mu <- mean(train$rating)
+just_the_sum <- train %>% 
+  group_by(movieId) %>% 
+  summarize(s = sum(rating - mu), n_i = n())
+rmses <- sapply(lambdas, function(l){
+  predicted_ratings <- test %>% 
+    left_join(just_the_sum, by='movieId') %>% 
+    mutate(b_i = s/(n_i+l)) %>%
+    mutate(pred = mu + b_i) %>%
+    .$pred
+  return(RMSE(test$rating, predicted_ratings))
+})
+qplot(lambdas, rmses)  
+lambda <- lambdas[which.min(rmses)] 
+lambda # 1.75 for movie effects
+
+# penalty term  with value 1.75 -> see above how it is chosen (cross validation)
+# lambda <- 1.75 # use lambda from above directly
+mu <- mean(train$rating)
+movie_reg_avgs <- train %>% 
+  group_by(movieId) %>% 
+  summarize(b_i = sum(rating - mu)/(n()+lambda), n_i = n()) 
+
+predicted_ratings <- test %>% 
+  left_join(movie_reg_avgs, by='movieId') %>%
+  mutate(pred = mu + b_i) %>%
+  .$pred
+
+rmse.model4 <- RMSE(test$rating, predicted_ratings)
+mae.model4 <- MAE(test$rating, predicted_ratings)
+
+rmse_results <- bind_rows(rmse_results,
+                          data_frame(method="Regularized Movie Effects Model",  
+                                     RMSE = rmse.model4, MAE = mae.model4 ))
+```
+
+Regularization for movie and user effects
+
+$Y_{u,i} = \mu + \dfrac{1}{\lambda + n_i} b_i + \dfrac{1}{\lambda + n_u} b_u + \varepsilon_{u,i}$
+
+In this case we minimize $\sum_{u, i} (y_{u,i} - \mu - b_i - b_u)^2 + \lambda (\sum_i b_i^2 + \sum_u b_u^2)$.
+
+```{r model-movie-user-reg, warning=FALSE, message=FALSE}
+# for movie and user effects
+# choose lambda using cross validation
+lambdas <- seq(0, 10, 0.25)
+rmses <- sapply(lambdas, function(l){
+  mu <- mean(train$rating)
+  b_i <- train %>%
+    group_by(movieId) %>%
+    summarize(b_i = sum(rating - mu)/(n()+l))
+  b_u <- train %>% 
+    left_join(b_i, by="movieId") %>%
+    group_by(userId) %>%
+    summarize(b_u = sum(rating - b_i - mu)/(n()+l))
+  predicted_ratings <- 
+    test%>% 
+    left_join(b_i, by = "movieId") %>%
+    left_join(b_u, by = "userId") %>%
+    mutate(pred = mu + b_i + b_u) %>%
+    .$pred
+  return(RMSE(test$rating, predicted_ratings))
+})
+
+qplot(lambdas, rmses)  
+
+lambda <- lambdas[which.min(rmses)]
+lambda # 4.5 for movie and user effects
+
+# penalty term -> see above how it is chosen (cross validation)
+# use lambda from above directly
+mu <- mean(train$rating)
+movie_reg_avgs <- train %>% 
+  group_by(movieId) %>% 
+  summarize(b_i = sum(rating - mu)/(n()+lambda), n_i = n()) 
+
+user_reg_avgs <- train %>% 
+  left_join(movie_reg_avgs, by="movieId") %>%
+  group_by(userId) %>%
+  summarize(b_u = sum(rating - b_i - mu)/(n()+lambda), n_i = n()) 
+
+predicted_ratings <- test %>% 
+  left_join(movie_reg_avgs, by = "movieId") %>%
+  left_join(user_reg_avgs, by = "userId") %>%
+  mutate(pred = mu + b_i + b_u) %>%
+  .$pred
+
+rmse.model5 <- RMSE(test$rating, predicted_ratings)
+mae.model5 <- MAE(test$rating, predicted_ratings)
+
+rmse_results <- bind_rows(rmse_results,
+                          data_frame(method="Regularized Movie + User Effect Model",  
+                                     RMSE = rmse.model5, MAE = mae.model5 ))
+```
+
+```{r clean-up-4, echo=FALSE, message=FALSE, warning=FALSE, results=FALSE}
+# remove unneeded variables
+rm(predicted_ratings, just_the_sum, movie_avgs, movie_reg_avgs, user_avgs, user_reg_avgs, lambda, lambdas, rmses, mu)
+gc()
+```
+
+### Model using matrix factorization (and regularization)
+
+With matrix factorization the rating matrix is approximated using two smaller matrices each with a reduced number of features. An user-feature and an item-feature matrix of lower dimension are used for prediction. Lower dimension means also less computational power is needed and results are generated faster.
+
+This decomposition may detect latent features that are present in the rating data, but are not fully covered by user or movie effects (e.g. user-item interactions).
+
+$R \approx P'Q$, where $R$ is an $m \times n$ matrix, $P$ is an $k \times n$ matrix and $Q$ is an $k \times n$ matrix. 
+The number of latent features is $k$.
+
+The predicted rating for user _u_ on item _i_ is given by $p'_uq_i$, with the corresponding model:  
+
+$Y_{u,i} = p'_uq_i + \varepsilon_{u,i}$  
+
+The algorithm for matrix factorization makes use of stochastic gradient descent. Several parameters of the algorithm can be tuned for optimal performance: 
+number of dimensions (latent features), learning rate, number of iterations and regularization parameters.
+
+We will use the _recosystem_ library (@qiu2021package) for this purpose. It was developed specifically for recommender systems applications using matrix factorization. 
+Being a wrapper of C-language implementations, it is relatively fast and suitable for parallel computations, even in case of memory limitations.
+
+
+```{r model-matrix-factor, warning=FALSE, message=FALSE}
+# use recosystem library for matrix factorization and predictions
+train_set = data_memory(user_index = train$userId, item_index = train$movieId, 
+                          rating = train$rating, index1 = TRUE)
+test_set  = data_memory(user_index = test$userId, item_index = test$movieId, 
+                          rating = NULL, index1 = TRUE)
+r = Reco()
+# dim  -> number of latent factors: use 20, then tune
+# r$train(train_set, opts = c(dim = 20, nthread = 1, niter = 20))
+# Return results as R vector
+# predicted_ratings <- r$predict(test_set, out_memory())
+# get RMSE
+# rmse.model6.notune <- RMSE(test$rating, predicted_ratings)
+# rmse.model6.notune
+
+set.seed(1, sample.kind="Rounding")
+# model tuning for: number of latent factors (dim), learning rate (lrate)
+opts = r$tune(train_set, opts = list(dim = c(10, 20, 30), lrate = c(0.1, 0.2),
+                                     costp_l1 = 0, costq_l1 = 0,
+                                     nthread = 1, niter = 10))
+# opts
+# opts$min
+# use the tuned values for training
+r$train(train_set, opts = c(opts$min, nthread = 1, niter = 20))
+
+# Return results as R vector
+predicted_ratings <- r$predict(test_set, out_memory())
+head(predicted_ratings, 10)
+# r$model
+# check for NA values
+# sum(is.na(predicted_ratings))
+
+# get RMSE
+rmse.model6 <- RMSE(test$rating, predicted_ratings)
+mae.model6 <- MAE(test$rating, predicted_ratings)
+
+rmse_results <- bind_rows(rmse_results,
+                          data_frame(method="Matrix Factorization Model",  
+                                     RMSE = rmse.model6, MAE = mae.model6))
+```
+
+### Model using collaborative filtering
+
+Collaborative filtering uses similarities measures between users or between items to select of predict ratings. For the prediction, only ratings of users/items from a neighborhood are considered. The main types of filtering are user-user and item-item respectively. Item-item is considered more stable and more efficient when the number of users is significantly lower than the number of items.
+
+Due to high computational impact with large datasets (such as Movielens-10M)
+we only mention this approach here, but will not implement it or provide results for it. Helpful are the _recommenderlab_ package and collaborative filtering literature (see @hahsler2015recommenderlab, @falk2019practical).
+
+### Choosing the model for final validation
+
+When we compare the RMSE for the used models, the best performing model turns out to be matrix factorization.
+We will use this for the final predictions on the validation (final holdout) data.
+
+```{r model-comparison, echo=FALSE, warning=FALSE, message=FALSE}
+rmse_results %>% knitr::kable()
+```
+
+
+## Predictions on the final holdout data
+
+Before making the predictions, the chosen model is re-trained on the entire edx data, in order to increase the information
+obtained from available data.
+
+```{r clean-up-5, echo=FALSE, message=FALSE, warning=FALSE, results=FALSE}
+# remove unneeded variables
+rm(train, test)
+gc()
+```
+
+```{r model-matrix-vali, warning=FALSE, message=FALSE}
+# evaluate the chosen model on the final hold-out validation set
+
+# tune the model: retrain on full edx dataset, then test on validation data for final RMSE
+# load the datasets
+edx <- readRDS("edx.Rda")
+validation <- readRDS("vali.Rda")
+# create the training and test datasets
+train_set = data_memory(user_index = edx$userId, item_index = edx$movieId, 
+                          rating = edx$rating, index1 = TRUE)
+test_set  = data_memory(user_index = validation$userId, item_index = validation$movieId, 
+                          rating = NULL, index1 = TRUE)
+```
+
+```{r clean-up-6, echo=FALSE, message=FALSE, warning=FALSE, results=FALSE}
+rm(edx)
+gc()
+```
+
+```{r model-matrix-vali-retrained, message=FALSE, warning=FALSE}
+r = Reco()
+set.seed(1, sample.kind="Rounding")
+# model tuning for: number of latent factors (dim), learning rate (lrate)
+opts = r$tune(train_set, opts = list(dim = c(10, 20, 30), lrate = c(0.1, 0.2),
+                                     costp_l1 = 0, costq_l1 = 0,
+                                     nthread = 1, niter = 10))
+# opts$min
+# use the tuned values for training
+r$train(train_set, opts = c(opts$min, nthread = 1, niter = 20))
+# Return results as R vector
+predicted_ratings <- r$predict(test_set, out_memory())
+# head(predicted_ratings, 10)
+# save to file as well
+
+# check for NA values
+# sum(is.na(predicted_ratings))
+# get RMSE
+rmse.final.retrained <- RMSE(validation$rating, predicted_ratings)
+mae.final.retrained <- MAE(validation$rating, predicted_ratings)
+```
+
+Now the RMSE and MAE can be computed for the matrix factorization model on the validation data:
+
+```{r rmse-matrix-vali-retrained, message=FALSE, warning=FALSE}
+rmse.final.retrained
+mae.final.retrained
+```
+
+```{r clean-up-7, echo=FALSE, message=FALSE, warning=FALSE, results=FALSE}
+rm(validation)
+gc()
+```
+
+## Results
+
+From the models listed and used, an RMSE of ~0.86 or below can be achieved using the user and movie effects model and, more clearly, 
+the matrix factorization model. On the final validation data, the matrix factorization model generates
+an RMSE of `r rmse.final.retrained`. 
+
+Matrix factorization is effective, however it might be less easy to explain the detected features and translate them
+into known, business relevant factors.
+
+## Conclusion
+
+We explored the Movielens-10M data and we tested different approaches for rating prediction. The Matrix factorization model proved very effective and delivered the lowest RMSE, with the (regularized) movie and user effects model as valuable alternative. 
+
+Although only briefly mentioned in this report, collaborative filtering could provide similar performance. The same might be true for other approaches like neural networks or models which include additional information about user preferences or movie content. 
+Other topics related to recommender systems like data collection, real-time systems or cold start for new users were not discussed here, but they are important for any real-world implementation. Further suggestions on these can be found in @falk2019practical.
+
+
+## References
+
